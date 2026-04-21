@@ -1,32 +1,39 @@
 import streamlit as st
+from streamlit_webrtc import webrtc_streamer, VideoTransformerBase
 import cv2
 import mediapipe as mp
 import numpy as np
 import time
 import os
 
-# --- KONFIGURASI HALAMAN STREAMLIT ---
+# --- KONFIGURASI HALAMAN ---
 st.set_page_config(page_title="Kicau Mania Detector", page_icon="🐾")
-st.title("🐾 Kicau Mania Detector")
-st.text("Pastikan webcam aktif. Gunakan dua tangan untuk trigger video!")
+st.title("🐾 Kicau Mania Web Detector")
+st.markdown("""
+Aplikasi ini mendeteksi:
+1. **Dua tangan** menutupi area mulut.
+2. **Kibasan tangan** (gerakan kanan/kiri) saat mulut tertutup.
+3. **Trigger** akan memutar video otomatis.
+""")
 
-# --- KONSTANTA ---
+# --- KONSTANTA LOGIKA ---
 CAT_VIDEO_PATH = "kicau-mania.mp4" 
 WAVE_THRESHOLD = 1
 WAVE_AMPLITUDE = 0.01
 MOUTH_COVER_DISTANCE = 0.35
 COVER_WAVE_WINDOW = 5.0
-PLAY_TIMEOUT = 0.8 # Disesuaikan sedikit untuk sinkronisasi web
+PLAY_TIMEOUT = 1.0
 
-# --- SETUP MEDIAPIPE ---
+# --- SETUP MEDIAPIPE (Global agar tidak berat) ---
 mp_hands = mp.solutions.hands
 mp_face_mesh = mp.solutions.face_mesh
 mp_draw = mp.solutions.drawing_utils
 
+# Inisialisasi model
 hands_detector = mp_hands.Hands(max_num_hands=2, min_detection_confidence=0.5)
 face_mesh_detector = mp_face_mesh.FaceMesh(max_num_faces=1, refine_landmarks=True)
 
-# --- CLASS & FUNGSI HELPER ---
+# --- CLASS DETEKTOR ---
 class WaveDetector:
     def __init__(self):
         self.last_x = None
@@ -65,108 +72,103 @@ class WaveDetector:
         if is_wave: self.reset()
         return is_wave
 
-def get_hand_center(hand_landmarks):
-    wrist = hand_landmarks.landmark[0]
-    return wrist.x, wrist.y
+# --- WORKER PEMROSES VIDEO ---
+class KicauProcessor(VideoTransformerBase):
+    def __init__(self):
+        self.wave_left = WaveDetector()
+        self.wave_right = WaveDetector()
+        self.last_mouth_cover_time = 0
+        self.is_playing = False
+        self.last_movement_time = 0
+        
+        # Load video trigger
+        self.video_cap = cv2.VideoCapture(CAT_VIDEO_PATH)
 
-def get_mouth_center(face_landmarks):
-    upper = face_landmarks.landmark[13]
-    lower = face_landmarks.landmark[14]
-    return (upper.x + lower.x)/2, (upper.y + lower.y)/2
-
-def is_mouth_covered(hand_centers, mouth_center):
-    if not mouth_center or len(hand_centers) < 2: return False
-    for hx, hy in hand_centers:
-        if np.hypot(hx - mouth_center[0], hy - mouth_center[1]) <= MOUTH_COVER_DISTANCE:
-            return True
-    return False
-
-# --- LOGIKA UTAMA ---
-def main():
-    # Placeholder untuk tampilan Streamlit
-    frame_placeholder = st.empty()
-    video_placeholder = st.empty()
-    stop_button = st.button("Stop Program")
-
-    # Load Video Kicau
-    cat_cap = cv2.VideoCapture(CAT_VIDEO_PATH)
-    
-    # Setup Kamera
-    cap = cv2.VideoCapture(0)
-    
-    wave_left = WaveDetector()
-    wave_right = WaveDetector()
-    last_mouth_cover_time = 0
-    is_playing = False
-    last_movement_time = 0
-
-    while cap.isOpened() and not stop_button:
-        ret, frame = cap.read()
-        if not ret: break
-
-        frame = cv2.flip(frame, 1)
-        h, w, _ = frame.shape
-        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    def recv(self, frame):
+        img = frame.to_ndarray(format="bgr24")
+        img = cv2.flip(img, 1)
+        h, w, _ = img.shape
+        rgb_frame = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         
         hands_result = hands_detector.process(rgb_frame)
         face_result = face_mesh_detector.process(rgb_frame)
 
         hand_centers = []
         mouth_center = None
-
-        if face_result.multi_face_landmarks:
-            mouth_center = get_mouth_center(face_result.multi_face_landmarks[0])
-            cv2.circle(frame, (int(mouth_center[0]*w), int(mouth_center[1]*h)), 10, (255,255,255), -1)
-
-        if hands_result.multi_hand_landmarks:
-            for res in hands_result.multi_hand_landmarks:
-                mp_draw.draw_landmarks(frame, res, mp_hands.HAND_CONNECTIONS)
-                hand_centers.append(get_hand_center(res))
-
-        # Sort tangan kiri ke kanan
-        hand_centers.sort(key=lambda p: p[0])
         now = time.time()
 
-        # Deteksi Gerakan
-        mouth_recent = (now - last_mouth_cover_time) <= COVER_WAVE_WINDOW
-        if is_mouth_covered(hand_centers, mouth_center):
-            last_mouth_cover_time = now
+        # 1. Deteksi Mulut
+        if face_result.multi_face_landmarks:
+            face_landmarks = face_result.multi_face_landmarks[0]
+            upper = face_landmarks.landmark[13]
+            lower = face_landmarks.landmark[14]
+            mouth_center = ((upper.x + lower.x)/2, (upper.y + lower.y)/2)
+            cv2.circle(img, (int(mouth_center[0]*w), int(mouth_center[1]*h)), 10, (255, 255, 255), 2)
 
+        # 2. Deteksi Tangan
+        if hands_result.multi_hand_landmarks:
+            for res in hands_result.multi_hand_landmarks:
+                mp_draw.draw_landmarks(img, res, mp_hands.HAND_CONNECTIONS)
+                wrist = res.landmark[0]
+                hand_centers.append((wrist.x, wrist.y))
+
+        # 3. Logika Trigger
+        hand_centers.sort(key=lambda p: p[0])
+        
+        # Cek Tutup Mulut
+        mouth_covered = False
+        if mouth_center and len(hand_centers) >= 2:
+            for hx, hy in hand_centers:
+                if np.hypot(hx - mouth_center[0], hy - mouth_center[1]) <= MOUTH_COVER_DISTANCE:
+                    mouth_covered = True
+                    break
+        
+        if mouth_covered:
+            self.last_mouth_cover_time = now
+        
+        mouth_recent = (now - self.last_mouth_cover_time) <= COVER_WAVE_WINDOW
+
+        # Cek Kibasan
         wave_now = False
         if len(hand_centers) > 0:
-            w_l = wave_left.update(hand_centers[0][0])
-            w_r = wave_right.update(hand_centers[1][0]) if len(hand_centers) > 1 else False
+            w_l = self.wave_left.update(hand_centers[0][0])
+            w_r = self.wave_right.update(hand_centers[1][0]) if len(hand_centers) > 1 else False
             wave_now = w_l or w_r
 
-        # Trigger Video
-        if len(hand_centers) >= 2 and mouth_recent and wave_now and not is_playing:
-            is_playing = True
-            last_movement_time = now
-            cat_cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+        # Status Trigger
+        if len(hand_centers) >= 2 and mouth_recent and wave_now and not self.is_playing:
+            self.is_playing = True
+            self.last_movement_time = now
+            self.video_cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
 
-        # Logika Tampilan Video
-        if is_playing:
-            if wave_left.is_moving() or wave_right.is_moving():
-                last_movement_time = now
+        # 4. Overlay Video Jika Aktif
+        if self.is_playing:
+            if self.wave_left.is_moving() or self.wave_right.is_moving():
+                self.last_movement_time = now
             
-            if now - last_movement_time > PLAY_TIMEOUT:
-                is_playing = False
-                video_placeholder.empty() # Hapus video dari layar
+            if now - self.last_movement_time > PLAY_TIMEOUT:
+                self.is_playing = False
             else:
-                ret_v, v_frame = cat_cap.read()
+                ret_v, v_frame = self.video_cap.read()
                 if not ret_v:
-                    cat_cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                    ret_v, v_frame = cat_cap.read()
+                    self.video_cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                    ret_v, v_frame = self.video_cap.read()
+                
                 if ret_v:
-                    # Tampilkan video di bawah kamera
-                    v_frame = cv2.cvtColor(v_frame, cv2.COLOR_BGR2RGB)
-                    video_placeholder.image(v_frame, caption="🐾 KICAU MANIA AKTIF 🐾", use_container_width=True)
+                    # Resize video agar pas di pojok atau menutupi layar
+                    v_frame = cv2.resize(v_frame, (w // 2, h // 2))
+                    img[0:h//2, 0:w//2] = v_frame
+                    cv2.putText(img, "KICAU MODE ON", (10, h//2 + 30), 
+                                cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
 
-        # Update Frame Kamera
-        frame_placeholder.image(rgb_frame, channels="RGB", use_container_width=True)
+        return frame.from_ndarray(img, format="bgr24")
 
-    cap.release()
-    cat_cap.release()
-
-if __name__ == "__main__":
-    main()
+# --- MENJALANKAN WEBRTC ---
+webrtc_streamer(
+    key="kicaumania",
+    video_transformer_factory=KicauProcessor,
+    rtc_configuration={
+        "iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]
+    },
+    media_stream_constraints={"video": True, "audio": False},
+)
